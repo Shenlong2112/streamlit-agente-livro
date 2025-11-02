@@ -1,0 +1,27 @@
+# Núcleo LangChain (linha 0.3 + Pydantic 2)
+pydantic>=2.7.4,<3
+langchain==0.3.27
+langchain-core==0.3.79
+langchain-community==0.3.31
+langchain-text-splitters==0.3.11
+langchain-openai==0.3.35
+
+# Vetores
+faiss-cpu
+
+# App / UI
+streamlit
+
+# OpenAI utilitários
+tiktoken
+python-dotenv
+
+# Google Drive (API)
+google-api-python-client
+google-auth
+google-auth-oauthlib
+
+# Utilidades que já apareceram nos erros
+unidecode
+
+duckduckgo-search==5.3.1
