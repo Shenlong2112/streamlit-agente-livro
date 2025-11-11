@@ -1,109 +1,114 @@
 # pages/0_Conexoes.py
-from __future__ import annotations
+import logging
+from urllib.parse import urlparse, parse_qs
 
-import time
 import streamlit as st
+from src.storage.drive import get_auth_url, exchange_code_for_token, drive_service_from_token
 
-from src.storage.drive import (
-    get_auth_url,
-    handle_oauth_callback,
-    drive_me,
-    ensure_app_folder,
-)
+st.set_page_config(page_title="Conexões", page_icon="🔌", layout="centered")
 
-st.set_page_config(page_title="Conexões", page_icon="🔌")
+# estado inicial
+st.session_state.setdefault("OPENAI_API_KEY", "")
+st.session_state.setdefault("google_token", None)
+st.session_state.setdefault("google_connected", False)
 
-# ---- sessão: chaves padrão (evita perder entre reruns) ----
-st.session_state.setdefault("openai_key", "")
-st.session_state.setdefault("drive_token", None)
+# trata retorno do OAuth (query params)
+try:
+    q = st.query_params  # streamlit >= 1.31
+    code = q.get("code")
+    error = q.get("error")
+except Exception:
+    q = st.experimental_get_query_params()
+    code = q.get("code", [None])[0]
+    error = q.get("error", [None])[0]
+
+if error:
+    st.error(f"Erro do Google OAuth: {error}")
+
+if code and not st.session_state.get("google_connected"):
+    try:
+        token = exchange_code_for_token(code)
+        st.session_state["google_token"] = token
+        st.session_state["google_connected"] = True
+        # limpa query params
+        try:
+            st.query_params.clear()
+        except Exception:
+            st.experimental_set_query_params()
+        st.success("Google Drive conectado com sucesso.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha ao concluir o OAuth: {e}")
 
 st.title("🔌 Conexões")
 
-# ----------------------------
-# OPENAI BYOK (chave do usuário)
-# ----------------------------
-st.subheader("OpenAI – sua própria chave (BYOK)")
-st.caption("A chave é mantida apenas na sessão do app (não salvamos em disco).")
-
-openai_key_input = st.text_input(
-    "OPENAI_API_KEY",
-    value=st.session_state.get("openai_key", ""),
-    type="password",
-    placeholder="cole sua chave aqui",
-)
-# Atualiza sessão sempre que o valor mudar
-if openai_key_input != st.session_state["openai_key"]:
-    st.session_state["openai_key"] = openai_key_input
-
-if st.session_state["openai_key"]:
-    st.success("Chave armazenada na sessão.")
-
-st.divider()
-
-# ----------------------------
-# GOOGLE DRIVE (OAuth)
-# ----------------------------
-st.subheader("Google Drive")
-
-# Trata retorno do OAuth (code nos query params) ANTES de mostrar o botão
-query_params = st.query_params
-if "code" in query_params and not st.session_state.get("drive_token"):
-    try:
-        token = handle_oauth_callback(query_params.get("code"))
-        st.session_state["drive_token"] = token
-        st.success("Google Drive conectado com sucesso!")
-
-        # Mostra quem é o usuário e valida pasta do app
-        me = drive_me(st.session_state["drive_token"])
-        st.info(f"Conectado como: **{me.get('emailAddress', 'desconhecido')}**")
-        folder_id = ensure_app_folder(st.session_state["drive_token"])
-        st.caption(f"Pasta do app pronta (id: {folder_id})")
-
-        # Redireciona para o Editor, mantendo a MESMA aba
-        st.info("Redirecionando para o Editor…")
-        time.sleep(0.6)
-        try:
-            st.switch_page("pages/1_Editor_de_Livro.py")
-        except Exception:
-            st.experimental_rerun()
-
-    except Exception as e:
-        st.error(f"Falha ao concluir a conexão com o Google Drive: {e}")
-
-# Se ainda não há token, mostra o botão para iniciar o OAuth
-if not st.session_state.get("drive_token"):
-    auth_url = get_auth_url()
-    
-    # Força abrir/voltar NA MESMA ABA (evita perder a session_state)
-    st.markdown(
-        f'''
-        <a href="{auth_url}" target="_self">
-            <button style="padding:0.6rem 1rem; font-size:1rem;">Conectar Google Drive</button>
-        </a>
-        ''',
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "Se aparecer erro 400 de redirect, confira no Google Cloud Console os "
-        "Authorized redirect URIs e inclua: "
-        "`http://localhost:8501/Conexoes`, `http://localhost:8501/Conexoes/`, "
-        "`http://127.0.0.1:8501/Conexoes`, `http://127.0.0.1:8501/Conexoes/`."
-    )
+# OpenAI BYOK
+st.subheader("OpenAI (sua chave)")
+st.caption("A chave fica apenas nesta sessão do navegador.")
+openai_key = st.text_input("OPENAI_API_KEY", type="password", value=st.session_state["OPENAI_API_KEY"])
+st.session_state["OPENAI_API_KEY"] = (openai_key or "").strip()
+if st.session_state["OPENAI_API_KEY"]:
+    st.success("Chave da OpenAI inserida.")
 else:
-    # Já conectado: exibe status
-    try:
-        me = drive_me(st.session_state["drive_token"])
-        st.success(f"Google Drive já conectado: **{me.get('emailAddress', 'desconhecido')}**")
-        folder_id = ensure_app_folder(st.session_state["drive_token"])
-        st.caption(f"Pasta do app pronta (id: {folder_id})")
-    except Exception as e:
-        st.error(f"Token inválido/expirado. Reconecte. Detalhe: {e}")
-        st.session_state["drive_token"] = None
+    st.info("Cole sua chave da OpenAI para habilitar o agente.")
 
 st.divider()
 
-st.caption(
-    "Após conectar o Google Drive e informar sua OPENAI_API_KEY, acesse o **Editor de Livro**. "
-    "Observação: este ambiente local usa `http://localhost:8501/Conexoes` como Redirect URI."
-)
+# Google Drive
+st.subheader("Google Drive")
+st.caption("Conecte sua conta para criar/ler arquivos (escopo `drive.file`).")
+
+if st.session_state.get("google_connected") and st.session_state.get("google_token"):
+    st.success("Google Drive conectado.")
+    try:
+        _ = drive_service_from_token(st.session_state["google_token"])
+    except Exception as e:
+        st.warning(f"Conectado, mas houve um alerta ao criar o service: {e}")
+else:
+    try:
+        auth_url = get_auth_url()
+    except Exception as e:
+        st.error(f"Não foi possível gerar o link de conexão. Verifique os Secrets do app. Detalhe: {e}")
+        auth_url = None
+
+    cols = st.columns([1, 1])
+    with cols[0]:
+        if auth_url:
+            st.link_button("Conectar Google Drive", auth_url, use_container_width=True)
+        else:
+            st.button("Conectar Google Drive", disabled=True, use_container_width=True)
+
+    with cols[1]:
+        dbg = st.toggle("🔧 Debug do OAuth", value=False, help="Mostra a URL de autorização e parâmetros (remova depois).")
+
+    if dbg and auth_url:
+        st.divider()
+        st.caption("🔍 auth_url")
+        st.code(auth_url, language="text")
+        try:
+            qs = parse_qs(urlparse(auth_url).query)
+            show = {
+                "client_id": qs.get("client_id", []),
+                "redirect_uri": qs.get("redirect_uri", []),
+                "scope": qs.get("scope", []),
+                "response_type": qs.get("response_type", []),
+                "access_type": qs.get("access_type", []),
+                "prompt": qs.get("prompt", []),
+                "state": "<presente>" if "state" in qs else "<ausente>",
+            }
+            st.json(show)
+        except Exception as e:
+            st.warning(f"Não foi possível parsear o auth_url: {e}")
+        logging.info("AUTH_URL -> %s", auth_url)
+
+with st.expander("Verificação rápida dos Secrets (nomes apenas)"):
+    try:
+        keys = list(st.secrets.keys())
+        redir = st.secrets.get("GOOGLE_REDIRECT_URI", "")
+        cid = st.secrets.get("GOOGLE_CLIENT_ID", "")
+        st.write({"secrets_keys": keys})
+        st.write({"client_id_suffix": cid[-20:] if isinstance(cid, str) else ""})
+        st.write({"redirect_uri": redir})
+    except Exception as e:
+        st.warning(f"Secrets não disponíveis: {e}")
 
