@@ -73,6 +73,7 @@ if "code" in query_params and not st.session_state.get("drive_token"):
 # Se ainda não há token, mostra o botão para iniciar o OAuth
 if not st.session_state.get("drive_token"):
     auth_url = get_auth_url()
+    
     # Força abrir/voltar NA MESMA ABA (evita perder a session_state)
     st.markdown(
         f'''

@@ -1,211 +1,214 @@
 # src/storage/drive.py
 from __future__ import annotations
 
-import json
+import io
 import time
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
+
 import requests
 import streamlit as st
-
-# ---- Config (lê do secrets.toml) ----
-GOOGLE_CLIENT_ID = st.secrets.get("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = st.secrets.get("GOOGLE_CLIENT_SECRET")
-APP_FOLDER = st.secrets.get("APP_FOLDER", "Apps/AgenteLivro")
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from urllib.parse import urlencode, quote as urlquote
 
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
-DRIVE_FILES = "https://www.googleapis.com/drive/v3/files"
-DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
-DRIVE_ABOUT = "https://www.googleapis.com/drive/v3/about"
+GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file openid email profile"
 
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-# Em DEV local, a rota da sua página de conexões:
-REDIRECT_URI = "http://localhost:8501/Conexoes"
+# ---------- helpers ----------
+def _assert_secrets() -> None:
+    missing = [k for k in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI") if k not in st.secrets]
+    if missing:
+        raise RuntimeError(f"Configure {', '.join(missing)} em .streamlit/secrets.toml")
 
-# ------------------ OAuth helpers ------------------
 
-def _assert_secrets():
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise RuntimeError("Configure GOOGLE_CLIENT_ID/SECRET em .streamlit/secrets.toml")
+def _esc_drive_str(s: str) -> str:
+    """Escapa aspas e barras para a query do Drive (Apostrophe precisa de \\')."""
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
+
+# ---------- OAuth ----------
 def get_auth_url() -> str:
+    """Gera a URL de autorização (força seletor de conta)."""
     _assert_secrets()
-    from urllib.parse import urlencode
     params = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
+        "client_id": st.secrets["GOOGLE_CLIENT_ID"],
+        "redirect_uri": st.secrets["GOOGLE_REDIRECT_URI"],
         "response_type": "code",
-        "scope": " ".join(SCOPES),
+        "scope": GOOGLE_OAUTH_SCOPE,
         "access_type": "offline",
-        "prompt": "consent",
         "include_granted_scopes": "true",
+        "prompt": "consent select_account",
     }
-    return f"{AUTH_ENDPOINT}?{urlencode(params)}"
+    return f"{AUTH_ENDPOINT}?{urlencode(params, quote_via=urlquote)}"
 
-def handle_oauth_callback(code: str) -> Dict[str, Any]:
+
+def exchange_code_for_token(code: str) -> Dict[str, Any]:
     _assert_secrets()
     data = {
         "code": code,
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI,
+        "client_id": st.secrets["GOOGLE_CLIENT_ID"],
+        "client_secret": st.secrets["GOOGLE_CLIENT_SECRET"],
+        "redirect_uri": st.secrets["GOOGLE_REDIRECT_URI"],
         "grant_type": "authorization_code",
     }
-    r = requests.post(TOKEN_ENDPOINT, data=data, timeout=30)
-    r.raise_for_status()
-    token = r.json()
-    token["created_at"] = int(time.time())
+    resp = requests.post(TOKEN_ENDPOINT, data=data, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Falha ao obter token ({resp.status_code}): {resp.text[:300]}")
+    token = resp.json()
+    if "expires_in" in token:
+        token["expires_at"] = int(time.time()) + int(token["expires_in"])
     return token
 
-def _auth_header(token: Dict[str,Any]) -> Dict[str,str]:
-    return {"Authorization": f"Bearer {token['access_token']}"}
 
-def _refresh_token(token: Dict[str,Any]) -> Dict[str,Any]:
-    _assert_secrets()
+def refresh_token_if_needed(token: Dict[str, Any]) -> Dict[str, Any]:
+    if not token:
+        raise RuntimeError("Token ausente.")
+    # ainda válido?
+    if token.get("expires_at", 0) - int(time.time()) > 60:
+        return token
     if "refresh_token" not in token:
-        raise RuntimeError("Sem refresh_token. Refaça a conexão ao Google Drive.")
+        return token
+
     data = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
+        "client_id": st.secrets["GOOGLE_CLIENT_ID"],
+        "client_secret": st.secrets["GOOGLE_CLIENT_SECRET"],
         "refresh_token": token["refresh_token"],
         "grant_type": "refresh_token",
     }
-    r = requests.post(TOKEN_ENDPOINT, data=data, timeout=30)
-    r.raise_for_status()
-    newtok = r.json()
-    token.update(newtok)
-    token["created_at"] = int(time.time())
+    resp = requests.post(TOKEN_ENDPOINT, data=data, timeout=30)
+    if resp.status_code != 200:
+        return token
+    newt = resp.json()
+    token["access_token"] = newt.get("access_token", token.get("access_token"))
+    if "expires_in" in newt:
+        token["expires_at"] = int(time.time()) + int(newt["expires_in"])
     return token
 
-def _ensure_fresh_token(token: Dict[str,Any]) -> Dict[str,Any]:
-    created = token.get("created_at", 0)
-    # margem antes dos 3600s
-    if int(time.time()) - created > 3300:
-        token = _refresh_token(token)
-    return token
 
-# ------------------ Drive basic ops ------------------
-
-def drive_me(token: Dict[str,Any]) -> Dict[str,Any]:
-    token = _ensure_fresh_token(token)
-    params = {"fields": "user"}
-    r = requests.get(DRIVE_ABOUT, headers=_auth_header(token), params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()["user"]
-
-def ensure_app_folder(token: Dict[str,Any]) -> str:
-    token = _ensure_fresh_token(token)
-    q = f"name = '{APP_FOLDER}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    params = {"q": q, "fields": "files(id,name)"}
-    r = requests.get(DRIVE_FILES, headers=_auth_header(token), params=params, timeout=30)
-    r.raise_for_status()
-    files = r.json().get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name": APP_FOLDER, "mimeType": "application/vnd.google-apps.folder"}
-    r = requests.post(DRIVE_FILES, headers=_auth_header(token), json=meta, timeout=30)
-    r.raise_for_status()
-    return r.json()["id"]
-
-def upload_bytes(token: Dict[str,Any], name: str, data: bytes, parent_id: Optional[str]=None, mime: str="application/octet-stream") -> str:
-    token = _ensure_fresh_token(token)
-    metadata = {"name": name}
-    if parent_id:
-        metadata["parents"] = [parent_id]
-    mmeta = ("metadata", ("metadata.json", json.dumps(metadata), "application/json; charset=UTF-8"))
-    mfile = ("file", (name, data, mime))
-    r = requests.post(
-        f"{DRIVE_UPLOAD}?uploadType=multipart",
-        headers=_auth_header(token),
-        files=[mmeta, mfile],
-        timeout=60,
+def drive_service_from_token(token: Dict[str, Any]):
+    token = refresh_token_if_needed(token)
+    creds = Credentials(
+        token=token.get("access_token"),
+        refresh_token=token.get("refresh_token"),
+        token_uri=TOKEN_ENDPOINT,
+        client_id=st.secrets["GOOGLE_CLIENT_ID"],
+        client_secret=st.secrets["GOOGLE_CLIENT_SECRET"],
+        scopes=GOOGLE_OAUTH_SCOPE.split(),
     )
-    r.raise_for_status()
-    return r.json()["id"]
+    # cache_discovery=False evita tentativa de cache em disco
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-def download_file(token: Dict[str,Any], file_id: str) -> bytes:
-    token = _ensure_fresh_token(token)
-    r = requests.get(f"{DRIVE_FILES}/{file_id}?alt=media", headers=_auth_header(token), timeout=120)
-    r.raise_for_status()
-    return r.content
 
-def find_file(token: Dict[str,Any], name: str, parent_id: Optional[str]=None) -> Optional[str]:
-    token = _ensure_fresh_token(token)
+# ---------- Drive utils ----------
+def _query_and_list(service, q: str, page_size: int = 100) -> List[Dict[str, Any]]:
+    files: List[Dict[str, Any]] = []
+    page_token = None
+    while True:
+        resp = service.files().list(
+            q=q,
+            spaces="drive",
+            fields="nextPageToken, files(id, name, mimeType, modifiedTime, size)",
+            pageToken=page_token,
+            pageSize=page_size,
+        ).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def find_or_create_folder(service, name: str, parent_id: Optional[str] = None) -> str:
+    q = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    q += f" and name = '{_esc_drive_str(name)}'"
     if parent_id:
-        q = f"name = '{name}' and '{parent_id}' in parents and trashed = false"
-    else:
-        q = f"name = '{name}' and trashed = false"
-    params = {"q": q, "fields": "files(id,name)"}
-    r = requests.get(DRIVE_FILES, headers=_auth_header(token), params=params, timeout=30)
-    r.raise_for_status()
-    files = r.json().get("files", [])
-    return files[0]["id"] if files else None
+        q += f" and '{parent_id}' in parents"
+    res = _query_and_list(service, q, page_size=50)
+    if res:
+        return res[0]["id"]
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        body["parents"] = [parent_id]
+    folder = service.files().create(body=body, fields="id").execute()
+    return folder["id"]
 
-def ensure_subfolder(token: Dict[str,Any], parent_id: str, name: str) -> str:
-    """Garante uma subpasta e retorna o id."""
-    token = _ensure_fresh_token(token)
-    q = f"name = '{name}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    params = {"q": q, "fields": "files(id,name)"}
-    r = requests.get(DRIVE_FILES, headers=_auth_header(token), params=params, timeout=30)
-    r.raise_for_status()
-    files = r.json().get("files", [])
-    if files:
-        return files[0]["id"]
-    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    r = requests.post(DRIVE_FILES, headers=_auth_header(token), json=meta, timeout=30)
-    r.raise_for_status()
-    return r.json()["id"]
 
-def update_file_bytes(token: Dict[str,Any], file_id: str, name: str, data: bytes, mime: str="application/octet-stream") -> str:
-    """Atualiza conteúdo de um arquivo existente (mantém o mesmo file_id)."""
-    token = _ensure_fresh_token(token)
-    metadata = {"name": name}
-    mmeta = ("metadata", ("metadata.json", json.dumps(metadata), "application/json; charset=UTF-8"))
-    mfile = ("file", (name, data, mime))
-    r = requests.patch(
-        f"{DRIVE_UPLOAD}/{file_id}?uploadType=multipart",
-        headers=_auth_header(token),
-        files=[mmeta, mfile],
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()["id"]
+def ensure_subfolder(service, parent_id: str, subfolder_name: str) -> str:
+    return find_or_create_folder(service, subfolder_name, parent_id=parent_id)
 
-def delete_file(token: Dict[str,Any], file_id: str) -> None:
-    token = _ensure_fresh_token(token)
-    r = requests.delete(f"{DRIVE_FILES}/{file_id}", headers=_auth_header(token), timeout=30)
-    if r.status_code not in (200, 204):
-        r.raise_for_status()
-
-# --------------- NOVO: listar arquivos de uma pasta ---------------
 
 def list_files_in_folder(
-    token: Dict[str,Any],
-    parent_id: str,
-    mime_contains: Optional[str] = None,
-    name_suffix: Optional[str] = None,
-    limit: int = 200,
+    service,
+    folder_id: str,
+    mime_type: Optional[str] = None,
+    name_equals: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Lista arquivos em uma pasta do Drive.
-    - mime_contains: filtra por substring do mimeType (ex.: 'json', 'zip')
-    - name_suffix: filtra por sufixo do nome (ex.: '.json')
-    Retorna: lista de dicts {id, name, mimeType, modifiedTime}
-    """
-    token = _ensure_fresh_token(token)
-    q = f"'{parent_id}' in parents and trashed = false"
-    if mime_contains:
-        q += f" and mimeType contains '{mime_contains}'"
-    params = {
-        "q": q,
-        "pageSize": min(limit, 1000),
-        "fields": "files(id,name,mimeType,modifiedTime)",
-        "orderBy": "modifiedTime desc",
-    }
-    r = requests.get(DRIVE_FILES, headers=_auth_header(token), params=params, timeout=30)
-    r.raise_for_status()
-    files = r.json().get("files", [])
-    if name_suffix:
-        files = [f for f in files if f.get("name","").endswith(name_suffix)]
+    q = f"trashed = false and '{folder_id}' in parents"
+    if mime_type:
+        q += f" and mimeType = '{_esc_drive_str(mime_type)}'"
+    if name_equals:
+        q += f" and name = '{_esc_drive_str(name_equals)}'"
+    return _query_and_list(service, q, page_size=100)
+
+
+def list_files_md(service, folder_id: str, extensions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    files = list_files_in_folder(service, folder_id)
+    if extensions:
+        exts = {e.lower() for e in extensions}
+        files = [f for f in files if any(f["name"].lower().endswith(x) for x in exts)]
+    files.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
     return files
+
+
+def upload_text(service, folder_id: str, filename: str, text: str) -> str:
+    media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=False)
+    body = {"name": filename, "parents": [folder_id]}
+    file = service.files().create(body=body, media_body=media, fields="id").execute()
+    return file["id"]
+
+
+def download_text(service, file_id: str) -> str:
+    req = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue().decode("utf-8", errors="replace")
+
+
+def upload_binary(service, folder_id: str, filename: str, data: bytes, mimetype: str = "application/octet-stream") -> str:
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=False)
+    body = {"name": filename, "parents": [folder_id]}
+    file = service.files().create(body=body, media_body=media, fields="id").execute()
+    return file["id"]
+
+
+def download_binary(service, file_id: str) -> bytes:
+    req = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def update_file_contents(service, file_id: str, data: bytes, mimetype: str = "application/octet-stream") -> None:
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mimetype, resumable=False)
+    service.files().update(fileId=file_id, media_body=media).execute()
+
+
+def safe_delete(service, file_id: str) -> None:
+    try:
+        service.files().delete(fileId=file_id).execute()
+    except HttpError as e:
+        # ignora 404
+        if getattr(e, "status_code", None) == 404:
+            return
+        raise
+
