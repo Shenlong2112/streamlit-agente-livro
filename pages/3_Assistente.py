@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import io
+import time
 import zipfile
 import tempfile
 from typing import List, Optional, TYPE_CHECKING, Any
@@ -23,8 +24,6 @@ from src.embeddings.vectorstore_faiss import (
 )
 
 # ===== LLM (BYOK) =====
-# Em runtime usamos _ChatOpenAI (pode ser None se a lib não estiver instalada).
-# Para type hints, usamos ChatOpenAI apenas dentro de TYPE_CHECKING, evitando o alerta do Pylance.
 try:
     from langchain_openai import ChatOpenAI as _ChatOpenAI  # runtime
 except Exception:
@@ -84,16 +83,44 @@ def _load_global_index_from_drive(service) -> Optional[object]:
 
 
 def _search_web_duckduckgo(q: str, k: int = 3) -> str:
+    """
+    Busca robusta no DuckDuckGo:
+    - tenta backend 'api'; se der rate limit, tenta 'html' e 'lite'
+    - faz algumas tentativas com backoff
+    - nunca deixa o app quebrar
+    """
     if DDGS is None:
-        return "⚠️ Módulo duckduckgo_search não está instalado no servidor."
-    out = []
-    with DDGS() as ddgs:
-        for i, r in enumerate(ddgs.text(q, max_results=k)):
-            title = r.get("title") or ""
-            href = r.get("href") or ""
-            body = r.get("body") or ""
-            out.append(f"{i+1}. {title}\n{href}\n{body}\n")
-    return "\n".join(out) if out else "Nenhum resultado encontrado."
+        return "⚠️ Módulo `duckduckgo_search` não está instalado no servidor."
+
+    backends = ("api", "html", "lite")
+    last_err = None
+
+    for backend in backends:
+        for attempt in range(3):
+            try:
+                # Alguns ambientes são sensíveis a muitas conexões persistentes; abre/fecha por tentativa.
+                with DDGS() as ddgs:
+                    # `backend` é suportado nas versões recentes (>=6.x). Garanta no requirements.txt.
+                    results = list(ddgs.text(q, max_results=k, backend=backend))
+                if results:
+                    out = []
+                    for i, r in enumerate(results, start=1):
+                        title = (r.get("title") or "").strip()
+                        href = (r.get("href") or "").strip()
+                        body = (r.get("body") or "").strip()
+                        out.append(f"{i}. {title}\n{href}\n{body}\n")
+                    return "\n".join(out)
+                # sem resultados não é erro — apenas tenta próximo backend
+                break
+            except Exception as e:
+                last_err = e
+                # backoff curto para aliviar rate limit
+                time.sleep(1.5 * (attempt + 1))
+                continue
+
+    if last_err:
+        return f"⚠️ Falha na busca web (rate limit/erro do DDG). Tente novamente em instantes.\nDetalhe: {type(last_err).__name__}"
+    return "Nenhum resultado encontrado."
 
 
 def _get_llm() -> Optional[ChatOpenAI]:
@@ -221,23 +248,19 @@ if prompt:
     # Caminho 1: pesquisa web explícita
     if do_web and prompt.strip().lower().startswith("web:"):
         query = prompt.split(":", 1)[1].strip() or prompt
-        if DDGS is None:
-            with st.chat_message("assistant"):
-                st.markdown("⚠️ Para usar a busca web, instale `duckduckgo_search` no servidor.")
-        else:
-            with st.spinner("Buscando na web (DuckDuckGo)..."):
-                web_text = _search_web_duckduckgo(query, k=5)
-            # Usa LLM para sintetizar os resultados web
-            sys = "Você é um assistente que sintetiza resultados de busca em respostas claras e objetivas."
-            usr = f"Consulta: {query}\n\nResultados:\n{web_text}\n\nResuma e responda de forma útil."
-            messages = [{"role": "system", "content": sys}, {"role": "user", "content": usr}]
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                acc = ""
-                for chunk in llm.stream(messages):
-                    acc += (chunk.content or "")
-                    placeholder.markdown(acc)
-                st.session_state["messages"].append({"role": "assistant", "content": acc})
+        with st.spinner("Buscando na web (DuckDuckGo)..."):
+            web_text = _search_web_duckduckgo(query, k=5)
+        # Usa LLM para sintetizar os resultados web
+        sys = "Você é um assistente que sintetiza resultados de busca em respostas claras e objetivas."
+        usr = f"Consulta: {query}\n\nResultados:\n{web_text}\n\nResuma e responda de forma útil."
+        messages = [{"role": "system", "content": sys}, {"role": "user", "content": usr}]
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            acc = ""
+            for chunk in llm.stream(messages):
+                acc += (chunk.content or "")
+                placeholder.markdown(acc)
+            st.session_state["messages"].append({"role": "assistant", "content": acc})
 
     # Caminho 2: RAG com acervo (prioridade máxima)
     else:
