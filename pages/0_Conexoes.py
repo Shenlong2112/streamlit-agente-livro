@@ -7,20 +7,20 @@ from src.storage.drive import get_auth_url, exchange_code_for_token, drive_servi
 
 st.set_page_config(page_title="Conexões", page_icon="🔌", layout="centered")
 
-# estado inicial
+# Estado inicial
 st.session_state.setdefault("OPENAI_API_KEY", "")
 st.session_state.setdefault("google_token", None)
 st.session_state.setdefault("google_connected", False)
 
-# trata retorno do OAuth (query params)
+# Também tratamos ?code aqui (se o usuário já estiver nesta página)
 try:
-    q = st.query_params  # streamlit >= 1.31
+    q = st.query_params
     code = q.get("code")
     error = q.get("error")
 except Exception:
     q = st.experimental_get_query_params()
-    code = q.get("code", [None])[0]
-    error = q.get("error", [None])[0]
+    code = (q.get("code") or [None])[0]
+    error = (q.get("error") or [None])[0]
 
 if error:
     st.error(f"Erro do Google OAuth: {error}")
@@ -30,7 +30,6 @@ if code and not st.session_state.get("google_connected"):
         token = exchange_code_for_token(code)
         st.session_state["google_token"] = token
         st.session_state["google_connected"] = True
-        # limpa query params
         try:
             st.query_params.clear()
         except Exception:
@@ -42,7 +41,7 @@ if code and not st.session_state.get("google_connected"):
 
 st.title("🔌 Conexões")
 
-# OpenAI BYOK
+# --- OpenAI BYOK ---
 st.subheader("OpenAI (sua chave)")
 st.caption("A chave fica apenas nesta sessão do navegador.")
 openai_key = st.text_input("OPENAI_API_KEY", type="password", value=st.session_state["OPENAI_API_KEY"])
@@ -54,12 +53,13 @@ else:
 
 st.divider()
 
-# Google Drive
+# --- Google Drive OAuth ---
 st.subheader("Google Drive")
-st.caption("Conecte sua conta para criar/ler arquivos (escopo `drive.file`).")
+st.caption("Conecte sua conta para criar/ler seus arquivos (escopo `drive.file`).")
 
 if st.session_state.get("google_connected") and st.session_state.get("google_token"):
     st.success("Google Drive conectado.")
+    # Teste opcional do service
     try:
         _ = drive_service_from_token(st.session_state["google_token"])
     except Exception as e:
@@ -71,14 +71,15 @@ else:
         st.error(f"Não foi possível gerar o link de conexão. Verifique os Secrets do app. Detalhe: {e}")
         auth_url = None
 
-    cols = st.columns([1, 1])
-    with cols[0]:
+    c1, c2 = st.columns([1, 1])
+    with c1:
         if auth_url:
-            st.link_button("Conectar Google Drive", auth_url, use_container_width=True)
+            # Abre NA MESMA ABA
+            st.markdown(f"[Conectar Google Drive]({auth_url})", unsafe_allow_html=True)
         else:
             st.button("Conectar Google Drive", disabled=True, use_container_width=True)
 
-    with cols[1]:
+    with c2:
         dbg = st.toggle("🔧 Debug do OAuth", value=False, help="Mostra a URL de autorização e parâmetros (remova depois).")
 
     if dbg and auth_url:
@@ -101,6 +102,7 @@ else:
             st.warning(f"Não foi possível parsear o auth_url: {e}")
         logging.info("AUTH_URL -> %s", auth_url)
 
+# Verificação (sem expor valores)
 with st.expander("Verificação rápida dos Secrets (nomes apenas)"):
     try:
         keys = list(st.secrets.keys())
@@ -111,4 +113,6 @@ with st.expander("Verificação rápida dos Secrets (nomes apenas)"):
         st.write({"redirect_uri": redir})
     except Exception as e:
         st.warning(f"Secrets não disponíveis: {e}")
+
+
 

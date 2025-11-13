@@ -1,56 +1,59 @@
-# app.py — LangChain-first + Drive/FAISS (Drive liga na página Conexões)
+# app.py
 import streamlit as st
-from typing import Optional
-from langchain_openai import ChatOpenAI
 
-st.set_page_config(page_title="Agente de Livro", page_icon="📚", layout="wide")
+# Precisamos só desta função aqui; o resto do fluxo fica na página Conexões
+from src.storage.drive import exchange_code_for_token
 
-def set_session_value(key: str, value: Optional[str]):
-    if value and value.strip():
-        st.session_state[key] = value.strip()
-    else:
-        st.session_state.pop(key, None)
+st.set_page_config(page_title="Agente do Livro", page_icon="📚", layout="wide")
 
-def has_session_value(key: str) -> bool:
-    return bool(st.session_state.get(key))
+# Estado base da sessão
+st.session_state.setdefault("google_connected", False)
+st.session_state.setdefault("google_token", None)
+st.session_state.setdefault("OPENAI_API_KEY", "")
 
-def test_openai_via_langchain(api_key: str) -> tuple[bool, str]:
+# ---- Captura retorno do Google quando ele volta para a RAIZ do app ----
+try:
+    q = st.query_params  # Streamlit recente
+    code = q.get("code")
+    error = q.get("error")
+except Exception:
+    q = st.experimental_get_query_params()  # fallback versões antigas
+    code = (q.get("code") or [None])[0]
+    error = (q.get("error") or [None])[0]
+
+if error:
+    st.warning(f"Google OAuth erro: {error}")
+
+if code and not st.session_state.get("google_connected"):
     try:
-        llm = ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=0.0, max_tokens=5)
-        _ = llm.invoke("ping").content
-        return True, "Conexão OK (key válida via LangChain)."
+        token = exchange_code_for_token(code)
+        st.session_state["google_token"] = token
+        st.session_state["google_connected"] = True
+        # Limpa parâmetros para não repetir
+        try:
+            st.query_params.clear()
+        except Exception:
+            st.experimental_set_query_params()
+        st.toast("Google Drive conectado com sucesso.", icon="✅")
+        # Volta para a página de Conexões (se suportado)
+        try:
+            st.switch_page("pages/0_Conexoes.py")
+        except Exception:
+            pass
     except Exception as e:
-        return False, f"Falha ao conectar: {e}"
+        st.error(f"Falha ao concluir o OAuth: {e}")
 
-with st.sidebar:
-    st.markdown("## Conexões")
-    st.caption("A OpenAI API key fica **somente nesta sessão** (RAM).")
-    openai_key_input = st.text_input("OpenAI API Key", type="password", value=st.session_state.get("user_openai_key", ""))
-    set_session_value("user_openai_key", openai_key_input)
+# ---- HOME (conteúdo simples) ----
+st.title("📚 Agente do Livro")
+st.write(
+    "Use o menu lateral para acessar **Conexões**, **Editor**, **Transcritor** e **Assistente**."
+)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Testar (LangChain)", use_container_width=True):
-            if not has_session_value("user_openai_key"):
-                st.error("Cole sua OpenAI API key primeiro.")
-            else:
-                ok, msg = test_openai_via_langchain(st.session_state["user_openai_key"])
-                st.success("✅ " + msg) if ok else st.error("❌ " + msg)
-    with c2:
-        if st.button("Limpar chave", use_container_width=True):
-            set_session_value("user_openai_key", None)
-            st.success("Chave removida da sessão.")
+# Status rápido
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Google Drive", "Conectado" if st.session_state.get("google_connected") else "Desconectado")
+with col2:
+    st.metric("OpenAI Key", "Definida" if bool(st.session_state.get("OPENAI_API_KEY")) else "Vazia")
 
-st.title("📚 Agente/Editor para Livro — (Drive + FAISS)")
-if has_session_value("user_openai_key"):
-    st.info("🔐 OpenAI key ativa nesta sessão.")
-else:
-    st.warning("Cole sua OpenAI key na **sidebar**.")
-
-st.markdown("""
-Use as páginas no menu:
-- **🔌 Conexões**: conectar **Google Drive** (OAuth). Nenhum arquivo fica no seu PC.
-- **📝 Editor de Livro**: listar **transcrições (.md) no seu Drive**, gerar **versões** e fixar **FINAL**.
-- **💬 Chatbot Knowledge**: chat que vai usar **somente** seu *knowledge* (quando ligarmos o RAG/FAISS).
-""")
 
