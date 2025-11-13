@@ -1,160 +1,97 @@
 # src/knowledge/repo.py
 from __future__ import annotations
 
-import json
-import time
 import re
-from typing import Dict, Any, Optional
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 from unidecode import unidecode
 
+# Funções utilitárias do Drive (já existentes no seu projeto)
 from src.storage.drive import (
-    ensure_app_folder,
+    drive_service_from_token,
+    find_or_create_folder,
     ensure_subfolder,
-    find_file,
-    upload_bytes,
-    download_file,
-    update_file_bytes,
+    list_files_in_folder,
+    list_files_md,
+    upload_text,
+    download_text,
+    upload_binary,
+    download_binary,
+    update_file_contents,
+    safe_delete,
 )
 
-# ===== Pastas lógicas dentro do APP_FOLDER no Drive =====
-TRANSCRICAO_DIR = "transcricao"   # ← transcrições brutas (Whisper)
-VERSOES_DIR     = "versoes"       # ← versões revisadas (Editor)
+# ============================
+# Constantes de estrutura
+# ============================
+ROOT_DIR_NAME: str = "AgenteLivro"
+TRANSCRICAO_DIR: str = "Transcricoes"   # sem acentos para evitar surpresas
+VERSOES_DIR: str = "Versoes"
+VECSTORE_DIR: str = "Vecstore"          # pasta separada para os índices/embeddings
 
-# ----------------- helpers internos -----------------
 
-def _folder_id(token: Dict[str, Any], subfolder: str) -> str:
-    """Resolve o ID da subpasta (transcricao/versoes) dentro do APP_FOLDER."""
-    root = ensure_app_folder(token)
-    return ensure_subfolder(token, root, subfolder)
+# ============================
+# Helpers de nome/título/arquivo
+# ============================
+def _slugify(title: str) -> str:
+    """Gera um 'slug' seguro para nomes de arquivos"""
+    t = unidecode(title or "").strip()
+    # primeira linha como título, se for um texto longo
+    if "\n" in t:
+        t = t.split("\n", 1)[0].strip()
+    t = t.lower()
+    t = re.sub(r"[^a-z0-9\-_. ]+", "", t)
+    t = re.sub(r"\s+", "_", t)
+    t = re.sub(r"_+", "_", t)
+    return t[:80] or "sem_titulo"
 
-def _json_name(doc_id: str) -> str:
-    return f"{doc_id}.json"
 
-_slug_ok = re.compile(r"[^a-z0-9\-]+")
-def _slugify(s: str) -> str:
-    if not s:
-        return "x"
-    s = unidecode(s).lower().strip()
-    s = s.replace(" ", "-").replace("_", "-")
-    s = _slug_ok.sub("-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s or "x"
+def build_version_filename(base_title: str, suffix: Optional[str] = None) -> str:
+    """Cria um nome de arquivo único para versões, com timestamp opcional."""
+    slug = _slugify(base_title)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if suffix:
+        return f"{slug}_{suffix}_{ts}.txt"
+    return f"{slug}_{ts}.txt"
 
-def _write_version_txt(
-    token: Dict[str, Any],
-    doc_id: str,
-    text: str,
-    subfolder: str,
-    version_index: int,
-    source: str = "versao",
-) -> str:
-    """Cria um arquivo .txt individual para a versão."""
-    folder_id = _folder_id(token, subfolder)
-    name = f"{_slugify(doc_id)}__{_slugify(source)}__{version_index:03d}.txt"
-    return upload_bytes(
-        token,
-        name,
-        text.encode("utf-8"),
-        parent_id=folder_id,
-        mime="text/plain; charset=UTF-8",
-    )
 
-# ----------------- API pública -----------------
-
-def save_doc(
-    token: Dict[str, Any],
-    doc_id: str,
-    text: str,
-    meta: Optional[Dict[str, Any]] = None,
-    subfolder: str = VERSOES_DIR,
-) -> str:
+# ============================
+# Árvore de pastas do usuário
+# ============================
+def ensure_user_tree(service) -> Dict[str, str]:
     """
-    Cria um novo manifesto JSON (histórico) com a primeira versão (se texto vier).
-    Retorna file_id do JSON no Drive. Também grava .txt da v1 se 'text' não for vazio.
+    Garante a árvore padrão no Google Drive do usuário e retorna os IDs.
+    Retorno: {"root": ..., "trans": ..., "versions": ..., "vec": ...}
     """
-    ts = int(time.time())
-    payload = {
-        "id": doc_id,
-        "created_at": ts,
-        "versions": [],
-    }
-    # Se já vier uma primeira versão
-    if text:
-        payload["versions"].append({"ts": ts, "text": text, "meta": (meta or {})})
+    root_id = find_or_create_folder(service, ROOT_DIR_NAME)
+    trans_id = ensure_subfolder(service, root_id, TRANSCRICAO_DIR)
+    versions_id = ensure_subfolder(service, root_id, VERSOES_DIR)
+    vec_id = ensure_subfolder(service, root_id, VECSTORE_DIR)
+    return {"root": root_id, "trans": trans_id, "versions": versions_id, "vec": vec_id}
 
-    folder_id = _folder_id(token, subfolder)
-    name = _json_name(doc_id)
-    fid = upload_bytes(
-        token,
-        name,
-        # Sem escapes unicode feios
-        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        parent_id=folder_id,
-        mime="application/json; charset=UTF-8",
-    )
 
-    # Se já tinha texto, gravar .txt v1
-    if text:
-        source = (meta or {}).get("source", "versao")
-        _write_version_txt(token, doc_id, text, subfolder, version_index=1, source=source)
+# ============================
+# Ações comuns do editor/transcritor
+# ============================
+def list_texts_in_folder(service, folder_id: str) -> List[Dict[str, str]]:
+    """Lista arquivos .txt (ou .md) em uma pasta, ordenados por modificação decrescente."""
+    return list_files_md(service, folder_id, extensions=[".txt", ".md"])
 
-    return fid
 
-def get_doc(
-    token: Dict[str, Any],
-    doc_id: str,
-    subfolder: str = VERSOES_DIR,
-) -> Dict[str, Any]:
+def download_text_file(service, file_id: str) -> str:
+    """Baixa conteúdo de texto de um file_id."""
+    return download_text(service, file_id)
+
+
+def save_new_version_text(service, versions_folder_id: str, base_title: str, text: str, add_suffix_version: bool = True) -> Tuple[str, str]:
     """
-    Carrega o manifesto JSON (lança FileNotFoundError se não existir).
+    Salva um novo arquivo de versão de texto e retorna (file_id, filename).
+    Se add_suffix_version=True, acrescenta algo como '_v' no nome antes do timestamp.
     """
-    folder_id = _folder_id(token, subfolder)
-    name = _json_name(doc_id)
-    fid = find_file(token, name, parent_id=folder_id)
-    if not fid:
-        raise FileNotFoundError(f"{name} não encontrado em {subfolder}")
-    data = download_file(token, fid)
-    return json.loads(data.decode("utf-8"))
+    suffix = "v" if add_suffix_version else None
+    filename = build_version_filename(base_title, suffix=suffix)
+    file_id = upload_text(service, versions_folder_id, filename, text)
+    return file_id, filename
 
-def append_version(
-    token: Dict[str, Any],
-    doc_id: str,
-    text: str,
-    meta: Optional[Dict[str, Any]] = None,
-    subfolder: str = VERSOES_DIR,
-) -> str:
-    """
-    Acrescenta uma nova versão ao manifesto JSON **e** salva um .txt próprio.
-    Retorna o file_id atualizado (JSON) no Drive.
-    """
-    folder_id = _folder_id(token, subfolder)
-    name = _json_name(doc_id)
-    fid = find_file(token, name, parent_id=folder_id)
-    if not fid:
-        # se não existe, cria como primeira versão
-        return save_doc(token, doc_id, text, meta, subfolder=subfolder)
-
-    current = json.loads(download_file(token, fid).decode("utf-8"))
-    current["versions"].append({
-        "ts": int(time.time()),
-        "text": text,
-        "meta": (meta or {}),
-    })
-
-    # Atualiza manifesto JSON (sem \uXXXX)
-    fid = update_file_bytes(
-        token,
-        fid,
-        name,
-        json.dumps(current, ensure_ascii=False).encode("utf-8"),
-        mime="application/json; charset=UTF-8",
-    )
-
-    # Grava .txt para ESTA versão
-    version_index = len(current["versions"])  # 1-based
-    source = (meta or {}).get("source", "versao")
-    _write_version_txt(token, doc_id, text, subfolder, version_index=version_index, source=source)
-
-    return fid
 
