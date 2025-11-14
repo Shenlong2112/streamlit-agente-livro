@@ -6,6 +6,23 @@ from src.storage.drive import exchange_code_for_token
 
 st.set_page_config(page_title="Agente do Livro", page_icon="📚", layout="wide")
 
+# --- CSS global (apenas visual: esconde ícones de GitHub/Fork/Deploy) ---
+st.markdown(
+    """
+    <style>
+      /* Barra de ferramentas do topo (onde ficam ícones de fork/github) */
+      [data-testid="stToolbar"] { visibility: hidden !important; height: 0 !important; position: fixed !important; top: -100px !important; }
+      /* Badges/links de deploy/visualização que às vezes aparecem */
+      .viewerBadge_container__1QSob { display: none !important; }
+      .stAppDeployButton { display: none !important; }
+      [data-testid="stStatusWidget"] { display: none !important; }
+      /* Links diretos ao GitHub no header/footer, se existirem */
+      header a[href*="github.com"], footer a[href*="github.com"] { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Estado base da sessão
 st.session_state.setdefault("google_connected", False)
 st.session_state.setdefault("google_token", None)
