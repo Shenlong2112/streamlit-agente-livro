@@ -1,97 +1,45 @@
 # src/knowledge/repo.py
 from __future__ import annotations
 
-import re
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
-from unidecode import unidecode
+from src.storage.drive import find_or_create_folder, ensure_subfolder
 
-# Funções utilitárias do Drive (já existentes no seu projeto)
-from src.storage.drive import (
-    drive_service_from_token,
-    find_or_create_folder,
-    ensure_subfolder,
-    list_files_in_folder,
-    list_files_md,
-    upload_text,
-    download_text,
-    upload_binary,
-    download_binary,
-    update_file_contents,
-    safe_delete,
-)
+# Nome do diretório raiz do app no Drive
+ROOT_DIR_NAME = "Agente_Livro"
 
-# ============================
-# Constantes de estrutura
-# ============================
-ROOT_DIR_NAME: str = "AgenteLivro"
-TRANSCRICAO_DIR: str = "Transcricoes"   # sem acentos para evitar surpresas
-VERSOES_DIR: str = "Versoes"
-VECSTORE_DIR: str = "Vecstore"          # pasta separada para os índices/embeddings
+# Subpastas
+TRANSCRICAO_DIR = "Transcricoes"   # áudios transcritos (bruto)
+VERSOES_DIR = "Versoes"            # versões revisadas/salvas pelo Editor
+VECSTORE_DIR = "Vecstore"          # pacotes .faiss.zip (embeddings)
+REFERENCIAS_DIR = "Referencias"    # <<< NOVO: PDFs e textos derivados de PDFs
 
-
-# ============================
-# Helpers de nome/título/arquivo
-# ============================
-def _slugify(title: str) -> str:
-    """Gera um 'slug' seguro para nomes de arquivos"""
-    t = unidecode(title or "").strip()
-    # primeira linha como título, se for um texto longo
-    if "\n" in t:
-        t = t.split("\n", 1)[0].strip()
-    t = t.lower()
-    t = re.sub(r"[^a-z0-9\-_. ]+", "", t)
-    t = re.sub(r"\s+", "_", t)
-    t = re.sub(r"_+", "_", t)
-    return t[:80] or "sem_titulo"
-
-
-def build_version_filename(base_title: str, suffix: Optional[str] = None) -> str:
-    """Cria um nome de arquivo único para versões, com timestamp opcional."""
-    slug = _slugify(base_title)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if suffix:
-        return f"{slug}_{suffix}_{ts}.txt"
-    return f"{slug}_{ts}.txt"
-
-
-# ============================
-# Árvore de pastas do usuário
-# ============================
 def ensure_user_tree(service) -> Dict[str, str]:
     """
-    Garante a árvore padrão no Google Drive do usuário e retorna os IDs.
-    Retorno: {"root": ..., "trans": ..., "versions": ..., "vec": ...}
+    Garante a árvore de pastas do usuário no Drive e retorna os IDs.
     """
     root_id = find_or_create_folder(service, ROOT_DIR_NAME)
     trans_id = ensure_subfolder(service, root_id, TRANSCRICAO_DIR)
     versions_id = ensure_subfolder(service, root_id, VERSOES_DIR)
     vec_id = ensure_subfolder(service, root_id, VECSTORE_DIR)
-    return {"root": root_id, "trans": trans_id, "versions": versions_id, "vec": vec_id}
+    refs_id = ensure_subfolder(service, root_id, REFERENCIAS_DIR)  # novo
 
+    return {
+        "root": root_id,
+        "trans": trans_id,
+        "versions": versions_id,
+        "vec": vec_id,
+        "refs": refs_id,  # novo
+    }
 
-# ============================
-# Ações comuns do editor/transcritor
-# ============================
-def list_texts_in_folder(service, folder_id: str) -> List[Dict[str, str]]:
-    """Lista arquivos .txt (ou .md) em uma pasta, ordenados por modificação decrescente."""
-    return list_files_md(service, folder_id, extensions=[".txt", ".md"])
-
-
-def download_text_file(service, file_id: str) -> str:
-    """Baixa conteúdo de texto de um file_id."""
-    return download_text(service, file_id)
-
-
-def save_new_version_text(service, versions_folder_id: str, base_title: str, text: str, add_suffix_version: bool = True) -> Tuple[str, str]:
+def build_version_filename(base_title: str, suffix: Optional[str] = None) -> str:
     """
-    Salva um novo arquivo de versão de texto e retorna (file_id, filename).
-    Se add_suffix_version=True, acrescenta algo como '_v' no nome antes do timestamp.
+    Gera um nome de arquivo com timestamp. Ex.: "capitulo_1_20250101_121314.txt"
     """
-    suffix = "v" if add_suffix_version else None
-    filename = build_version_filename(base_title, suffix=suffix)
-    file_id = upload_text(service, versions_folder_id, filename, text)
-    return file_id, filename
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if suffix:
+        return f"{base_title}_{suffix}_{ts}.txt"
+    return f"{base_title}_{ts}.txt"
 
 
